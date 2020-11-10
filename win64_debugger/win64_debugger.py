@@ -2,6 +2,7 @@ from ctypes import *
 from ctypes.wintypes import *
 from win64_debugger.structs import *
 import traceback
+import sys
 
 kernel32 = WinDLL('kernel32', use_last_error=True)
 
@@ -360,6 +361,9 @@ class Debugger():
 
 
     def set_hardware_breakpoint(self, address, length, condition):
+        """
+        Set a hardware breakpoint in all active threads.
+        """
         if length in (1, 2, 4):
             # Convert to debug register number
             length -= 1
@@ -382,27 +386,87 @@ class Debugger():
             # Enable exact data breakpoint match (if supported)
             context.Dr7 |= 1 << 8
 
-        # Save breakpoint address in available register
-        bp_address_registers = {
-            0: context.Dr0,
-            1: context.Dr1,
-            2: context.Dr2,
-            3: context.Dr3,
-        }
-        bp_address_registers[available] == address
+            # Save breakpoint address in available register
+            hardware_breakpoint_address_registers = {
+                0: context.Dr0,
+                1: context.Dr1,
+                2: context.Dr2,
+                3: context.Dr3,
+            }
+            hardware_breakpoint_address_registers[available] == address
 
+            # Set condition/type of breakpoint
+            context.Dr7 |= condition << ((available * 4) + 16)
 
-        # Set condition/type of breakpoint
-        context.Dr7 |= condition << ((available * 4) + 16)
+            # Set length (size in bytes)
+            context.Dr7 |= length << ((available * 4) + 18)
 
-        # Set length (size in bytes)
-        context.Dr7 |= length << ((available * 4) + 18)
-
-        thread_handle = self.open_thread(thread_id)
-        kernel32.SetThreadContext(thread_handle, byref(context))
+            thread_handle = self.open_thread(thread_id)
+            kernel32.SetThreadContext(thread_handle, byref(context))
 
         self.hardware_breakpoints[available] = (address, length, condition)
 
+        return True
+
+
+    def exception_handler_single_step(self):
+        """
+        Determine if single step occured in reaction to a hardware breakpoint
+        and grab the hit breakpoint.
+
+        Should check for BS flag in Dr6, but Windows doesn't propagate this
+        down correctly...
+        """
+        # slot = int.from_bytes(self.context.Dr6, sys.byteorder)
+        # if slot not in self.hardware_breakpoints:
+        #     continue_status = DBG_EXCEPTIoN_NOT_HANDLED
+        if self.context.Dr6 & 0x1 and self.hardware_breakpoints.has_key(0):
+            slot = 0
+        elif self.context.Dr6 & 0x2 and self.hardware_breakpoints.has_key(1):
+            slot = 1
+        elif self.context.Dr6 & 0x4 and self.hardware_breakpoints.has_key(2):
+            slot = 2
+        elif self.context.Dr6 & 0x8 and self.hardware_breakpoints.has_key(3):
+            slot = 3
+        else:
+            continue_status = DBG_EXCEPTION_NOT_HANDLED
+
+        if self.delete_hardware_breakpoint(slot):
+            continue_status = DBG_CONTINUE
+        
+        print("[*] Hardware breakpoint removed.")
+        return continue_status
+
+
+    def delete_hardware_breakpoint(self, slot):
+        """
+        Disable a hardware breakpoint in all active threads.
+        """
+        for thread_id in self.enumerate_threads():
+            context = self.get_thread_context(thread_id=thread_id)
+            # Remove breakpoint
+            context.Dr7 &= ~(1 << (slot * 2))
+            context.Dr7 &= ~(1 << 8)
+        
+            hardware_breakpoint_address_registers = {
+                0: context.Dr0,
+                1: context.Dr1,
+                2: context.Dr2,
+                3: context.Dr3,
+            }
+            hardware_breakpoint_address_registers[slot] = 0x00000000
+
+            # Remove condition/type flag
+            context.Dr7 &= ~(3 << ((available * 4) + 16))
+
+            # Remove length flag
+            context.Dr7 &= ~(3 << ((available * 4) + 18))
+
+            thread_handle = self.open_thread(thread_id)
+            kernel32.SetThreadContext(thread_handle, byref(context))
+
+        del self.hardware_breakpoints[slot]
+        
         return True
 
 
