@@ -47,6 +47,14 @@ kernel32.ReadProcessMemory.restype = BOOL
 kernel32.WriteProcessMemory.argtypes = [HANDLE, LPVOID, LPCVOID, c_size_t, POINTER(c_size_t)]
 kernel32.WriteProcessMemory.restype = BOOL
 
+kernel32.GetSystemInfo.argtypes = [SYSTEM_INFO]
+kernel32.GetSystemInfo.restype = BOOL
+
+kernel32.VirtualQueryEx.argtypes = [HANDLE, LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T]
+kernel32.VirtualQueryEx.restype = BOOL
+
+kernel32.VirtualProtextEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD. PDWORD]
+kernel32.VirtualProtextEx.restype = BOOL
 
 class Debugger():
     def __init__(self):
@@ -57,9 +65,17 @@ class Debugger():
         self.context = None
         self.exception = None
         self.exception_address = None
-        self.breakpoints = {}
+        self.soft_breakpoints = {}
         self.first_breakpoint = True
         self.hardware_breakpoints = {}
+
+        # Get default system page size
+        system_info = SYSTEM_INFO()
+        kernel32.GetSystemInfo(byref(system_info))
+        self.page_size = system_info.dwPageSize
+        
+        self.guarded_pages = {}
+        self.memory_breakpoints = {}
 
 
     def load(self, path_to_exe):
@@ -140,8 +156,8 @@ class Debugger():
 
     def get_debug_event(self):
         """
-        Get next debug event and handle event types.
-        Deactivate debugger when process is exited.
+        Gets next debug event and handle event types.
+        Deactivates debugger when process is exited.
         """
         debug_event = DEBUG_EVENT()
         continue_status = DBG_CONTINUE
@@ -164,17 +180,18 @@ class Debugger():
             
                 if self.exception == EXCEPTION_ACCESS_VIOLATION:
                     print("[**] Access violation detected")
-                    self.debugger_active = False  # This type seems to trigger infinite loop
+                    self.dump_registers()
+                    self.debugger_active = False  # Process doesn't seem to recover from this
                 elif self.exception == EXCEPTION_BREAKPOINT:
-                    # Soft breakpoint
+                    print("[**] Hit user defined soft breakpoint")
                     continue_status = self.exception_handler_breakpoint()
                 elif self.exception == EXCEPTION_GUARD_PAGE:
-                    # Memory breakpoint
-                    print("[**] Guard page access detected")
+                    print("[**] Hit memory breakpoint - guard page access detected")
+                    # System removes guard status for us
                 elif self.exception == EXCEPTION_SINGLE_STEP:
-                    # Hardware breakpoint
-                    print("[**] Single stepping")
-           
+                    print("[**] Hit hardware breakpoint - single stepping")
+                    self.exception_handler_single_step()
+                    
             elif event_code == EXIT_PROCESS_DEBUG_EVENT:
                 print("[*] Process exited")
                 self.debugger_active = False
@@ -190,12 +207,11 @@ class Debugger():
         """
         Handle soft breakpoints.
         """
-        if self.exception_address in self.breakpoints:
-            print("[**] Hit user defined breakpoint")
+        if self.exception_address in self.soft_breakpoints:
             # Put this back where it belongs
             self.write_process_memory(
                 self.exception_address,
-                self.breakpoints[self.exception_address]
+                self.soft_breakpoints[self.exception_address]
                 )
             
             # Reset thread context instruction pointer
@@ -212,7 +228,7 @@ class Debugger():
             else:
                 print("[**] Hit non-user-defined breakpoint")
 
-        print(f"[**] Exception address: {self.exception_address:016x}")
+        print(f"[**] Exception address: 0x{self.exception_address:016x}")
         return DBG_CONTINUE
 
 
@@ -342,17 +358,14 @@ class Debugger():
         Set a soft breakpoint at the specified memory `address`.
 
         Replaces a byte with INT3 (halt in operation code), to set a soft
-        breakpoint. Stores the original byte in `self.breakpoints`, to be
+        breakpoint. Stores the original byte in `self.soft_breakpoints`, to be
         reinserted when the breakpoint is hit.
-
-        See https://www.oreilly.com/library/view/mastering-assembly-programming/9781787287488/663ff39a-7ec3-4d2b-b6bd-43cdb6b0ca71.xhtml
-        for bit layout of Dr7 register.
         """
-        if address not in self.breakpoints:
+        if address not in self.soft_breakpoints:
             original_byte = self.read_process_memory(address, 1)
             # Replace with INT3
             if self.write_process_memory(address, b"\xCC"):
-                self.breakpoints[address] = original_byte
+                self.soft_breakpoints[address] = original_byte
                 print(f"[*] Soft breakpoint set at 0x{address:016x}")
                 return True
             
@@ -363,9 +376,21 @@ class Debugger():
     def set_hardware_breakpoint(self, address, length, condition):
         """
         Set a hardware breakpoint in all active threads.
+
+        See https://www.oreilly.com/library/view/mastering-assembly-programming/9781787287488/663ff39a-7ec3-4d2b-b6bd-43cdb6b0ca71.xhtml
+        for bit layout of Dr7 register.
+
+        Parameters
+        ----------
+        address
+            location of breakpoint in memory
+        length
+            length of data item to be monitored. 1, 2 or 4 bytes.
+        condition
+            when breakpoint should be triggered. HW_ACCESS, HW_EXCECUTE or HW_WRITE.
         """
         if length in (1, 2, 4):
-            # Convert to debug register number
+            # 0 indicates 1 byte length
             length -= 1
         else:
             return False
@@ -373,16 +398,19 @@ class Debugger():
         if condition not in (HW_ACCESS, HW_EXECUTE, HW_WRITE):
             return False
 
-        available = (set(range(4)) - set(self.hardware_breakpoints.keys())).pop()
+        available = (set(range(4)) - set(self.hardware_breakpoints.keys()))
 
         if len(available) < 1:
             return False
-        
+        else:
+            slot = available.pop()
+
         # Set debug control register flag in every thread
         for thread_id in self.enumerate_threads():
             context = self.get_thread_context(thread_id=thread_id)
+
             # Enable local breakpoint for available register
-            contex.Dr7 |= 1 << (available * 2)
+            context.Dr7 |= 1 << (slot * 2)
             # Enable exact data breakpoint match (if supported)
             context.Dr7 |= 1 << 8
 
@@ -393,18 +421,52 @@ class Debugger():
                 2: context.Dr2,
                 3: context.Dr3,
             }
-            hardware_breakpoint_address_registers[available] == address
+            hardware_breakpoint_address_registers[slot] = address
 
             # Set condition/type of breakpoint
-            context.Dr7 |= condition << ((available * 4) + 16)
+            context.Dr7 |= condition << ((slot * 4) + 16)
 
             # Set length (size in bytes)
-            context.Dr7 |= length << ((available * 4) + 18)
+            context.Dr7 |= length << ((slot * 4) + 18)
 
             thread_handle = self.open_thread(thread_id)
             kernel32.SetThreadContext(thread_handle, byref(context))
 
-        self.hardware_breakpoints[available] = (address, length, condition)
+        self.hardware_breakpoints[slot] = (address, length, condition)
+        print(f"[**] Hardware breakpoint set at 0x{address:016x}")
+
+        return True
+
+
+    def set_memory_breakpoint(self, address, size):
+        mbi = MEMORY_BASIC_INFORMATION()
+        if kernel32.VirtualQueryEx(
+            self.process_handle,
+            address,
+            byref(mbi),
+            sizeof(mbi)
+        ) < sizeof(mbi):  # Must be full size
+            return False
+        
+        current_page = c_ulong(0)
+        while current_page <= address + size:
+            self.guarded_pages.append(current_page)  # So we can identify those we've created
+
+            old_protection = c_ulong(0)
+
+            if not kernel32.VirtualProtextEx(
+                self.process_handle,
+                current_page,
+                size,
+                mbi.Protect | PAGE_GUARD,
+                byref(old_protection)
+            ):
+                return False
+            
+            # Increment by default system page size
+            current_page += self.page_size
+
+        self.memory_breakpoints[address] = (address, size, mbi)
 
         return True
 
@@ -417,9 +479,6 @@ class Debugger():
         Should check for BS flag in Dr6, but Windows doesn't propagate this
         down correctly...
         """
-        # slot = int.from_bytes(self.context.Dr6, sys.byteorder)
-        # if slot not in self.hardware_breakpoints:
-        #     continue_status = DBG_EXCEPTIoN_NOT_HANDLED
         if self.context.Dr6 & 0x1 and self.hardware_breakpoints.has_key(0):
             slot = 0
         elif self.context.Dr6 & 0x2 and self.hardware_breakpoints.has_key(1):
@@ -441,6 +500,8 @@ class Debugger():
     def delete_hardware_breakpoint(self, slot):
         """
         Disable a hardware breakpoint in all active threads.
+
+        Reverse of adding a hardware breakpoint.
         """
         for thread_id in self.enumerate_threads():
             context = self.get_thread_context(thread_id=thread_id)
@@ -470,16 +531,24 @@ class Debugger():
         return True
 
 
-    def resolve_function_address(self, dll, function):
+    @staticmethod
+    def resolve_function_address(dll, function):
         """
         Get the address of a function in the specified dynamic linked library
         (dll - i.e. module).
+
+        Parameters
+        ----------
+        dll
+            name of dll file that function is located in
+        function
+            name of function
         """
         module_handle = kernel32.GetModuleHandleW(dll)
 
         function_address = kernel32.GetProcAddress(
             module_handle,
-            function
+            bytes(function, "utf-8")  # Method requires byte str
             )
         # Don't need to worry about closing module "handle"
         return function_address

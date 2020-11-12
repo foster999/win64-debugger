@@ -9,4 +9,6 @@ LPBYTE = POINTER(c_ubyte)
 LPTSTR = POINTER(c_char)
 HANDLE = c_void_p
 PVOID = c_void_p
+LPVOID = c_void_p
 UINT_PTR = c_ulong
+SIZE_T = c_ulong
