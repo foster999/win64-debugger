@@ -47,7 +47,7 @@ kernel32.ReadProcessMemory.restype = BOOL
 kernel32.WriteProcessMemory.argtypes = [HANDLE, LPVOID, LPCVOID, c_size_t, POINTER(c_size_t)]
 kernel32.WriteProcessMemory.restype = BOOL
 
-kernel32.GetSystemInfo.argtypes = [SYSTEM_INFO]
+kernel32.GetSystemInfo.argtypes = [POINTER(SYSTEM_INFO)]
 kernel32.GetSystemInfo.restype = BOOL
 
 kernel32.VirtualQueryEx.argtypes = [HANDLE, LPCVOID, POINTER(MEMORY_BASIC_INFORMATION), SIZE_T]
@@ -56,11 +56,13 @@ kernel32.VirtualQueryEx.restype = BOOL
 kernel32.VirtualProtectEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD, POINTER(DWORD)]
 kernel32.VirtualProtectEx.restype = BOOL
 
+
 class Debugger():
     def __init__(self):
         self.process_handle = None
         self.pid = None
         self.debugger_active = False
+        self.debugger_attached = False
         self.thread_handle = None
         self.context = None
         self.exception = None
@@ -77,12 +79,21 @@ class Debugger():
         self.guarded_pages = {}
         self.memory_breakpoints = {}
 
+    def __enter__(self):
+        return self
+    
+    def __exit__(self):
+        self.run()
+        if self.debugger_attached:
+            self.detach()
+    
 
-    def load(self, path_to_exe, args):
+    def load(self, command):
         """
         Launch the specified executable, with debugging access for the
         process.
         """
+        executable = command[0]
         creation_flags = DEBUG_PROCESS
 
         startupinfo = STARTUPINFO()
@@ -93,10 +104,10 @@ class Debugger():
 
         startupinfo.cb = sizeof(startupinfo)
 
-        # Python 3 requires CreateProcessW as strings are UNICODE
+        # Python 3 requires CreateProcessW, for UNICODE str
         if kernel32.CreateProcessW(
-            path_to_exe,
-            args,
+            executable,
+            " ".join(command),
             None,
             None,
             None,
@@ -140,6 +151,7 @@ class Debugger():
         if kernel32.DebugActiveProcess(pid):
             self.debugger_active = True
             self.pid = int(pid)
+            self.debugger_attached = True
             print(f"[*] Attached to process: {pid}")
         else:
             raise SystemExit("[*] Failed to attach debugger to process")
@@ -237,6 +249,7 @@ class Debugger():
         Take process out of debug mode.
         """
         if kernel32.DebugActiveProcessStop(self.pid):
+            self.debugger_attached = False
             print("[*] Exiting debugger")
             return True
         else:
@@ -551,7 +564,7 @@ class Debugger():
             bytes(function, "utf-8")  # Method requires byte str
             )
         # Don't need to worry about closing module "handle"
-        return function_address
+        return hex(function_address)
 
 
     def dump_registers(self):
