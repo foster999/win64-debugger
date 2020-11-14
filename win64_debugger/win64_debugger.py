@@ -50,11 +50,11 @@ kernel32.WriteProcessMemory.restype = BOOL
 kernel32.GetSystemInfo.argtypes = [SYSTEM_INFO]
 kernel32.GetSystemInfo.restype = BOOL
 
-kernel32.VirtualQueryEx.argtypes = [HANDLE, LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T]
+kernel32.VirtualQueryEx.argtypes = [HANDLE, LPCVOID, POINTER(MEMORY_BASIC_INFORMATION), SIZE_T]
 kernel32.VirtualQueryEx.restype = BOOL
 
-kernel32.VirtualProtextEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD. PDWORD]
-kernel32.VirtualProtextEx.restype = BOOL
+kernel32.VirtualProtectEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD, POINTER(DWORD)]
+kernel32.VirtualProtectEx.restype = BOOL
 
 class Debugger():
     def __init__(self):
@@ -78,7 +78,7 @@ class Debugger():
         self.memory_breakpoints = {}
 
 
-    def load(self, path_to_exe):
+    def load(self, path_to_exe, args):
         """
         Launch the specified executable, with debugging access for the
         process.
@@ -96,7 +96,7 @@ class Debugger():
         # Python 3 requires CreateProcessW as strings are UNICODE
         if kernel32.CreateProcessW(
             path_to_exe,
-            None,
+            args,
             None,
             None,
             None,
@@ -454,7 +454,7 @@ class Debugger():
 
             old_protection = c_ulong(0)
 
-            if not kernel32.VirtualProtextEx(
+            if not kernel32.VirtualProtectEx(
                 self.process_handle,
                 current_page,
                 size,
